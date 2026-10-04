@@ -36,9 +36,9 @@ complete daily challenges and more.
 ## screenshots
 
 <p align="center">
-  <img src="images/screenshot1.png" width="250">
-  <img src="images/screenshot2.png" width="250">
-  <img src="images/screenshot3.png" width="250">
+  <img src="app/src/screenshot1.png" width="250">
+  <img src="app/src/screenshot2.png" width="250">
+  <img src="app/src/screenshot3.png" width="250">
 </p>
 
 ## development
