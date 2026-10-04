@@ -46,4 +46,4 @@ complete daily challenges and more.
 clone the repository:
 
 ```bash
-git clone https://github.com/USERNAME/REPOSITORY.git
+git clone https://github.com/defaulty0100/clckr..git
