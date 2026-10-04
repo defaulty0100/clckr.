@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  A customizable clicker game for Android.
+  a customizable clicker game for Android.
 </p>
 
 <p align="center">
@@ -16,24 +16,24 @@
 
 ---
 
-## About
+## about
 
-**clckr.** is a customizable clicker game for Android.
+**clckr.** is a customizable clicker game for android.
 
-Build your click count, buy upgrades, customize your button,
+build your click count, buy upgrades, customize your button,
 complete daily challenges and more.
 
-## Features
+## features
 
-- 🖱️ Customizable clicker
-- ⚡ AutoClickers
-- 📈 Click multipliers
-- 🎨 Custom colors and skins
-- 🏆 Ranked mode
-- 📅 Daily challenges
-- ⚙️ Extensive settings
+- 🖱️ customizable clicker
+- ⚡ autoclickers
+- 📈 click multipliers
+- 🎨 custom colors and skins
+- 🏆 ranked mode
+- 📅 daily challenges
+- ⚙️ extensive settings
 
-## Screenshots
+## screenshots
 
 <p align="center">
   <img src="images/screenshot1.png" width="250">
@@ -41,22 +41,22 @@ complete daily challenges and more.
   <img src="images/screenshot3.png" width="250">
 </p>
 
-## Tech Stack
+## tech stack
 
 - Kotlin
 - Jetpack Compose
 - Android SDK
 - Gradle
 
-## Installation
+## installation
 
-1. Download the latest APK from Releases.
-2. Install it on your Android device.
-3. Launch **clckr.**
+1. download the latest APK from Releases.
+2. install it on your android device.
+3. launch **clckr.**
 
-## Development
+## development
 
-Clone the repository:
+clone the repository:
 
 ```bash
 git clone https://github.com/USERNAME/REPOSITORY.git
