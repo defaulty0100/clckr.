@@ -39,6 +39,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -82,12 +83,18 @@ import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-private const val ADMIN_ACCESS_KEY = "K7FQ-2M9X-P4RA-8ZTC"
-
 private const val SUPABASE_URL = "https://jdlnufgabzpugbbpfhwv.supabase.co"
 private const val SUPABASE_PUBLISHABLE_KEY = "sb_publishable_NBMZG-973iGpUtKHF9BB4Q_lrqbxS4_"
 
 private data class CloudResponse(val code: Int, val body: String)
+
+private data class RankedLeaderboardEntry(
+    val username: String,
+    val elo: Int,
+    val matches: Int,
+    val badgeText: String?,
+    val badgeColor: String?
+)
 
 private suspend fun supabaseRequest(
     path: String,
@@ -227,8 +234,13 @@ private suspend fun cloudLogin(
         return null to "Login response was incomplete"
     }
 
+    prefs.edit().putString("cloud_access_token", accessToken).putString("cloud_refresh_token", refreshToken).putString("cloud_user_id", userId).apply()
+    val accountStatus = cloudGetMyAccountStatus(prefs)
+    if (accountStatus?.first == "banned") return null to "This account is banned"
+    if (accountStatus?.first == "suspended") return null to "This account is suspended"
+
     val profileResponse = supabaseRequest(
-        "/rest/v1/profiles?select=username,avatar_path,badge_text,badge_color&id=eq.${URLEncoder.encode(userId, "UTF-8")}",
+        "/rest/v1/profiles?select=username,avatar_path,badge_text,badge_color,elo,ranked_matches&id=eq.${URLEncoder.encode(userId, "UTF-8")}",
         "GET",
         accessToken = accessToken
     )
@@ -239,12 +251,16 @@ private suspend fun cloudLogin(
     var username: String? = null
     var badgeText: String? = null
     var badgeColor: String? = null
+    var rankedElo = 0
+    var rankedMatches = 0
 
     if (profiles.length() > 0) {
         val profile = profiles.getJSONObject(0)
         username = profile.optString("username").takeIf { it.isNotBlank() }
         badgeText = profile.optString("badge_text").takeIf { it.isNotBlank() }
         badgeColor = profile.optString("badge_color").takeIf { it.matches(Regex("#[0-9A-Fa-f]{6}")) }
+        rankedElo = profile.optInt("elo", 0)
+        rankedMatches = profile.optInt("ranked_matches", 0)
     }
 
     val finalUsername = username ?: return null to "Account profile not found"
@@ -257,12 +273,91 @@ private suspend fun cloudLogin(
         .putString("account_email", email.trim())
         .putString("account_badge_text", badgeText)
         .putString("account_badge_color", badgeColor)
+        .putInt("ranked_elo", rankedElo)
+        .putInt("ranked_matches", rankedMatches)
         .apply()
     return finalUsername to null
 }
 
+private suspend fun cloudRecordRankedResult(
+    prefs: SharedPreferences,
+    won: Boolean,
+    mode: String
+): Triple<Int, Int, Int>? {
+    val accessToken = prefs.getString("cloud_access_token", null) ?: return null
+    val response = supabaseRequest(
+        "/rest/v1/rpc/record_ranked_pve_result",
+        "POST",
+        JSONObject().apply {
+            put("p_won", won)
+            put("p_mode", mode)
+        }.toString(),
+        accessToken
+    )
+    if (response.code !in 200..299) return null
+    return try {
+        // The RPC now returns a JSON object directly. Keep array parsing as a
+        // compatibility fallback for older deployed versions.
+        val row = if (response.body.trimStart().startsWith("[")) {
+            val rows = org.json.JSONArray(response.body)
+            if (rows.length() == 0) null else rows.getJSONObject(0)
+        } else {
+            JSONObject(response.body)
+        }
+        if (row == null) null else {
+            val elo = row.optInt("new_elo", 0)
+            val matches = row.optInt("ranked_matches", 0)
+            val delta = row.optInt("delta", 0)
+            prefs.edit().putInt("ranked_elo", elo).putInt("ranked_matches", matches).apply()
+            Triple(elo, matches, delta)
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private suspend fun cloudLoadRankedLeaderboard(
+    prefs: SharedPreferences,
+    top100: Boolean
+): List<RankedLeaderboardEntry> {
+    val accessToken = prefs.getString("cloud_access_token", null) ?: return emptyList()
+    return try {
+        val result = mutableListOf<RankedLeaderboardEntry>()
+        var offset = 0
+        val pageSize = 1000
+        while (true) {
+            val limit = if (top100) 100 else pageSize
+            val path = "/rest/v1/profiles?select=username,elo,ranked_matches,badge_text,badge_color&ranked_matches=gt.0&order=elo.desc,username.asc&limit=$limit&offset=$offset"
+            val response = supabaseRequest(path, "GET", accessToken = accessToken)
+            if (response.code !in 200..299) break
+            val rows = org.json.JSONArray(response.body)
+            for (i in 0 until rows.length()) {
+                val row = rows.getJSONObject(i)
+                result += RankedLeaderboardEntry(
+                    username = row.optString("username"),
+                    elo = row.optInt("elo", 0),
+                    matches = row.optInt("ranked_matches", 0),
+                    badgeText = row.optString("badge_text").takeIf { it.isNotBlank() },
+                    badgeColor = row.optString("badge_color").takeIf { it.matches(Regex("#[0-9A-Fa-f]{6}")) }
+                )
+            }
+            if (top100 || rows.length() < pageSize) break
+            offset += pageSize
+        }
+        result
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private suspend fun cloudCheckAdmin(prefs: SharedPreferences): Boolean {
+    val accessToken = prefs.getString("cloud_access_token", null) ?: return false
+    val response = supabaseRequest("/rest/v1/rpc/is_current_user_admin", "POST", "{}", accessToken)
+    return response.code in 200..299 && response.body.trim().equals("true", ignoreCase = true)
+}
+
 private suspend fun cloudSetBadge(
-    email: String,
+    username: String,
     badgeText: String,
     badgeColor: String,
     prefs: SharedPreferences
@@ -272,14 +367,43 @@ private suspend fun cloudSetBadge(
         "/rest/v1/rpc/admin_set_badge",
         "POST",
         JSONObject().apply {
-            put("p_admin_key", ADMIN_ACCESS_KEY)
-            put("p_email", email.trim())
+            put("p_username", username.trim())
             put("p_badge_text", badgeText.trim())
             put("p_badge_color", badgeColor.trim())
         }.toString(),
         accessToken
     )
     return if (response.code in 200..299) null else cloudError(response, "Could not set badge")
+}
+
+private suspend fun cloudSetAccountStatus(
+    username: String,
+    status: String,
+    suspendMinutes: Int?,
+    prefs: SharedPreferences
+): String? {
+    val accessToken = prefs.getString("cloud_access_token", null) ?: return "Not logged in"
+    val until = if (status == "suspended") {
+        val minutes = suspendMinutes?.coerceAtLeast(1) ?: return "Enter suspend duration"
+        java.time.Instant.now().plusSeconds(minutes.toLong() * 60L).toString()
+    } else null
+    val body = JSONObject().apply {
+        put("p_username", username.trim())
+        put("p_status", status)
+        if (until == null) put("p_suspend_until", JSONObject.NULL) else put("p_suspend_until", until)
+    }.toString()
+    val response = supabaseRequest("/rest/v1/rpc/admin_set_account_status", "POST", body, accessToken)
+    return if (response.code in 200..299) null else cloudError(response, "Could not change account status")
+}
+
+private suspend fun cloudGetMyAccountStatus(prefs: SharedPreferences): Pair<String, String?>? {
+    val accessToken = prefs.getString("cloud_access_token", null) ?: return null
+    val response = supabaseRequest("/rest/v1/rpc/get_my_account_status", "POST", "{}", accessToken)
+    if (response.code !in 200..299) return null
+    return try {
+        val json = JSONObject(response.body)
+        json.optString("status", "active") to json.optString("suspend_until").takeIf { it.isNotBlank() }
+    } catch (_: Exception) { null }
 }
 
 private suspend fun cloudRefreshSession(prefs: SharedPreferences): Boolean {
@@ -297,13 +421,15 @@ private suspend fun cloudRefreshSession(prefs: SharedPreferences): Boolean {
     val userId = user?.optString("id").orEmpty()
     if (accessToken.isBlank() || userId.isBlank()) return false
     val profileResponse = supabaseRequest(
-        "/rest/v1/profiles?select=username,badge_text,badge_color&id=eq.${URLEncoder.encode(userId, "UTF-8")}",
+        "/rest/v1/profiles?select=username,badge_text,badge_color,elo,ranked_matches&id=eq.${URLEncoder.encode(userId, "UTF-8")}",
         "GET",
         accessToken = accessToken
     )
     var profileUsername: String? = null
     var profileBadgeText: String? = null
     var profileBadgeColor: String? = null
+    var profileRankedElo = 0
+    var profileRankedMatches = 0
     if (profileResponse.code in 200..299) {
         val rows = org.json.JSONArray(profileResponse.body)
         if (rows.length() > 0) {
@@ -311,6 +437,8 @@ private suspend fun cloudRefreshSession(prefs: SharedPreferences): Boolean {
             profileUsername = profile.optString("username").takeIf { it.isNotBlank() }
             profileBadgeText = profile.optString("badge_text").takeIf { it.isNotBlank() }
             profileBadgeColor = profile.optString("badge_color").takeIf { it.matches(Regex("#[0-9A-Fa-f]{6}")) }
+            profileRankedElo = profile.optInt("elo", 0)
+            profileRankedMatches = profile.optInt("ranked_matches", 0)
         }
     }
     prefs.edit()
@@ -320,6 +448,8 @@ private suspend fun cloudRefreshSession(prefs: SharedPreferences): Boolean {
         .putString("account_logged_username", profileUsername ?: prefs.getString("account_logged_username", null))
         .putString("account_badge_text", profileBadgeText)
         .putString("account_badge_color", profileBadgeColor)
+        .putInt("ranked_elo", profileRankedElo)
+        .putInt("ranked_matches", profileRankedMatches)
         .apply()
     return true
 }
@@ -382,7 +512,7 @@ private fun accountPrefsKey(username: String): String {
 }
 
 private fun generateDailyQuest(prefs: SharedPreferences) {
-    val duration = Random.nextInt(5, 51)
+    val duration = Random.nextInt(5, 51) + 5
     val error = Random.nextInt(-50, 51)
     val target = (duration * 10 + error).coerceIn(50, 500)
     prefs.edit()
@@ -402,9 +532,9 @@ private fun ensureDailyQuest(prefs: SharedPreferences): Triple<Int, Int, Int> {
     var target = prefs.getInt("daily_target", 0)
     var error = prefs.getInt("daily_error", 0)
 
-    if (duration !in 5..50 || target !in 50..500 || (nextRefresh > 0L && now >= nextRefresh)) {
+    if (duration !in 10..55 || target !in 50..500 || (nextRefresh > 0L && now >= nextRefresh)) {
         generateDailyQuest(prefs)
-        duration = prefs.getInt("daily_duration", 5)
+        duration = prefs.getInt("daily_duration", 1)
         target = prefs.getInt("daily_target", 50)
         error = prefs.getInt("daily_error", 0)
     }
@@ -429,6 +559,11 @@ private fun loadClicks(prefs: SharedPreferences): BigInteger {
     } catch (_: ClassCastException) {
         BigInteger.ZERO
     }
+}
+
+private fun accentTextColor(color: Color): Color {
+    val luminance = 0.299f * color.red + 0.587f * color.green + 0.114f * color.blue
+    return if (luminance > 0.6f) Color.Black else Color.White
 }
 
 class MainActivity : ComponentActivity() {
@@ -462,8 +597,8 @@ fun ClckrApp() {
         mutableStateOf(
             prefs.getString(
                 "theme",
-                "light"
-            ) ?: "light"
+                "default"
+            ) ?: "default"
         )
     }
 
@@ -475,11 +610,7 @@ fun ClckrApp() {
         mutableIntStateOf(
             prefs.getInt(
                 "accent_color",
-                AndroidColor.rgb(
-                    90,
-                    90,
-                    90
-                )
+                -1
             )
         )
     }
@@ -488,11 +619,15 @@ fun ClckrApp() {
 
     val darkTheme = when (theme) {
         "dark" -> true
-        "system" -> systemDark
+        "system", "default" -> systemDark
         else -> false
     }
 
-    val accentColor = Color(accentColorInt)
+    val accentColor = if (accentColorInt == -1) {
+        if (darkTheme) Color.White else Color.Black
+    } else {
+        Color(accentColorInt)
+    }
 
     LaunchedEffect(Unit) {
         delay(900)
@@ -503,16 +638,16 @@ fun ClckrApp() {
         colorScheme = if (darkTheme) {
             darkColorScheme(
                 primary = accentColor,
-                onPrimary = Color.White,
+                onPrimary = accentTextColor(accentColor),
                 secondary = accentColor,
-                onSecondary = Color.White
+                onSecondary = accentTextColor(accentColor)
             )
         } else {
             lightColorScheme(
                 primary = accentColor,
-                onPrimary = Color.White,
+                onPrimary = accentTextColor(accentColor),
                 secondary = accentColor,
-                onSecondary = Color.White
+                onSecondary = accentTextColor(accentColor)
             )
         }
     ) {
@@ -524,12 +659,12 @@ fun ClckrApp() {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Gray),
+                     .background(accentColor),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = "clckr.",
-                    color = Color.White,
+                    color = accentTextColor(accentColor),
                     fontSize = 32.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -545,9 +680,17 @@ fun ClckrApp() {
                 theme = theme,
                 onThemeChange = {
                     theme = it
-                    prefs.edit()
-                        .putString("theme", it)
-                        .apply()
+                    if (it == "default") {
+                        accentColorInt = -1
+                        prefs.edit()
+                            .putString("theme", it)
+                            .putInt("accent_color", -1)
+                            .apply()
+                    } else {
+                        prefs.edit()
+                            .putString("theme", it)
+                            .apply()
+                    }
                 },
                 accentColor = accentColor,
                 onAccentColorChange = {
@@ -575,10 +718,11 @@ fun GameScreen(
 ) {
 
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
 
     val systemDark = isSystemInDarkTheme()
 
-    val darkTheme = theme == "dark" || (theme == "system" && systemDark)
+    val darkTheme = theme == "dark" || ((theme == "system" || theme == "default") && systemDark)
 
     val textColor = if (darkTheme) Color.White else Color.Black
 
@@ -628,6 +772,7 @@ fun GameScreen(
     }
 
     var manualClickId by remember { mutableIntStateOf(0) }
+    // Rolling window for manual CPS detection. One continuous over-limit period = one violation.
     var bulbFlash by remember { mutableStateOf(false) }
 
     // =========================================================
@@ -738,6 +883,18 @@ fun GameScreen(
         mutableStateOf(prefs.getBoolean("custom_sound_bought", false))
     }
 
+    var customButtonBought by remember {
+        mutableStateOf(prefs.getBoolean("custom_button_bought", false))
+    }
+
+    var customButtonEnabled by remember {
+        mutableStateOf(prefs.getBoolean("custom_button_enabled", true))
+    }
+
+    var customButtonUri by remember {
+        mutableStateOf(prefs.getString("custom_button_uri", null))
+    }
+
     var customImageUri by remember {
         mutableStateOf(prefs.getString("custom_image_uri", null))
     }
@@ -788,10 +945,20 @@ fun GameScreen(
     var dailyNextRefresh by remember { mutableLongStateOf(prefs.getLong("daily_next_refresh", 0L)) }
 
     // =========================================================
-    // ADMIN
+    // RANKED MODE
     // =========================================================
 
-    var adminUnlocked by remember { mutableStateOf(prefs.getBoolean("admin_unlocked", false)) }
+    var rankedElo by remember { mutableIntStateOf(prefs.getInt("ranked_elo", 0)) }
+    var rankedMatches by remember { mutableIntStateOf(prefs.getInt("ranked_matches", 0)) }
+    var rankedBattleRunning by remember { mutableStateOf(false) }
+    var rankedBattleMode by remember { mutableStateOf("easy") }
+    var rankedResultGain by remember { mutableIntStateOf(0) }
+
+    // =========================================================
+    // SERVER-SIDE ADMIN
+    // =========================================================
+
+    var isAdmin by remember { mutableStateOf(false) }
 
     // =========================================================
     // LOCAL ACCOUNT
@@ -841,7 +1008,7 @@ fun GameScreen(
     LaunchedEffect(panel) {
         if (panel == "daily") {
             val quest = ensureDailyQuest(prefs)
-            dailyDuration = prefs.getInt("daily_duration_override", -1).takeIf { it in 5..50 } ?: quest.first
+            dailyDuration = prefs.getInt("daily_duration_override", -1).takeIf { it in 10..55 } ?: quest.first
             dailyError = quest.third
             dailyTarget = (dailyDuration * 10 + dailyError).coerceIn(50, 500)
             dailyNextRefresh = prefs.getLong("daily_next_refresh", 0L)
@@ -871,10 +1038,20 @@ fun GameScreen(
 
     LaunchedEffect(Unit) {
         if (cloudRefreshSession(prefs)) {
+            isAdmin = cloudCheckAdmin(prefs)
+            val accountStatus = cloudGetMyAccountStatus(prefs)
+            if (accountStatus?.first == "banned" || accountStatus?.first == "suspended") {
+                isAdmin = false
+                accountUsername = null
+                accountEmail = null
+                prefs.edit().remove("cloud_access_token").remove("cloud_refresh_token").remove("cloud_user_id").remove("account_logged_username").remove("account_email").apply()
+            } else {
             accountUsername = prefs.getString("account_logged_username", null)
             accountEmail = prefs.getString("account_email", null)
             accountBadgeText = prefs.getString("account_badge_text", null)
             accountBadgeColor = prefs.getString("account_badge_color", null)
+            rankedElo = prefs.getInt("ranked_elo", 0)
+            rankedMatches = prefs.getInt("ranked_matches", 0)
             val cloudSave = cloudLoadGame(prefs)
             if (cloudSave != null) {
                 cloudSave.optString("clicks").toBigIntegerOrNull()?.let { clicks = it }
@@ -884,6 +1061,7 @@ fun GameScreen(
                 if (cloudSave.has("selected_skin")) selectedSkin = cloudSave.optString("selected_skin", selectedSkin)
                 if (cloudSave.has("selected_shop_skin")) selectedShopSkin = cloudSave.optString("selected_shop_skin", selectedShopSkin)
                 if (cloudSave.has("selected_accessory")) selectedAccessory = cloudSave.optString("selected_accessory", selectedAccessory)
+            }
             }
         } else if (prefs.getString("cloud_refresh_token", null) != null) {
             accountUsername = null
@@ -993,6 +1171,22 @@ fun GameScreen(
             }
             customSoundUri = uri.toString()
             prefs.edit().putString("custom_sound_uri", uri.toString()).apply()
+        }
+    }
+
+    // =========================================================
+    // CUSTOM BUTTON PICKER
+    // =========================================================
+
+    val buttonPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Exception) { }
+            customButtonUri = uri.toString()
+            prefs.edit().putString("custom_button_uri", uri.toString()).apply()
         }
     }
 
@@ -1141,7 +1335,21 @@ fun GameScreen(
                             },
                         contentAlignment = Alignment.Center
                     ) {
-                        if (selectedShopSkin != "bulb") {
+                        if (customButtonBought && customButtonEnabled && customButtonUri != null) {
+                            val buttonBitmap = remember(customButtonUri, context) {
+                                try {
+                                    context.contentResolver.openInputStream(Uri.parse(customButtonUri))?.use { stream -> BitmapFactory.decodeStream(stream) }
+                                } catch (_: Exception) { null }
+                            }
+                            if (buttonBitmap != null) {
+                                Image(
+                                    bitmap = buttonBitmap.asImageBitmap(),
+                                    contentDescription = "Custom click button",
+                                    modifier = Modifier.fillMaxSize().clip(CircleShape),
+                                    contentScale = ContentScale.Crop
+                                )
+                            }
+                        } else if (selectedShopSkin != "bulb") {
                             when (selectedSkin) {
                             "default" -> {
                                 Box(
@@ -1235,7 +1443,7 @@ fun GameScreen(
                             else -> accentColor
                         }
 
-                        when (selectedShopSkin) {
+                        if (!(customButtonBought && customButtonEnabled && customButtonUri != null)) when (selectedShopSkin) {
                             "watch" -> WatchModel(
                                 modifier = Modifier.size(170.dp),
                                 dark = darkTheme,
@@ -1305,51 +1513,53 @@ fun GameScreen(
                                     customGradientBought = customGradientBought,
                                     ownedShopSkins = ownedShopSkins,
                                     ownedAccessories = ownedAccessories,
+                                    numberFormat = numberFormat,
+                                    numberDecimals = numberDecimals,
                                     onBuyBlue = {
-                                        if (clicks >= BigInteger.valueOf(100L)) {
-                                            clicks -= BigInteger.valueOf(100L)
+                                        if (clicks >= BigInteger.valueOf(10000L)) {
+                                            clicks -= BigInteger.valueOf(10000L)
                                             blueBought = true
                                             prefs.edit().putString("clicks", clicks.toString()).putBoolean("blue", true).apply()
                                         }
                                     },
                                     onBuyRed = {
-                                        if (clicks >= BigInteger.valueOf(250L)) {
-                                            clicks -= BigInteger.valueOf(250L)
+                                        if (clicks >= BigInteger.valueOf(20000L)) {
+                                            clicks -= BigInteger.valueOf(20000L)
                                             redBought = true
                                             prefs.edit().putString("clicks", clicks.toString()).putBoolean("red", true).apply()
                                         }
                                     },
                                     onBuyYellow = {
-                                        if (clicks >= BigInteger.valueOf(500L)) {
-                                            clicks -= BigInteger.valueOf(500L)
+                                        if (clicks >= BigInteger.valueOf(30000L)) {
+                                            clicks -= BigInteger.valueOf(30000L)
                                             yellowBought = true
                                             prefs.edit().putString("clicks", clicks.toString()).putBoolean("yellow", true).apply()
                                         }
                                     },
                                     onBuyGreen = {
-                                        if (clicks >= BigInteger.valueOf(750L)) {
-                                            clicks -= BigInteger.valueOf(750L)
+                                        if (clicks >= BigInteger.valueOf(40000L)) {
+                                            clicks -= BigInteger.valueOf(40000L)
                                             greenBought = true
                                             prefs.edit().putString("clicks", clicks.toString()).putBoolean("green", true).apply()
                                         }
                                     },
                                     onBuyCustom = {
-                                        if (clicks >= BigInteger.valueOf(5000L)) {
-                                            clicks -= BigInteger.valueOf(5000L)
+                                        if (clicks >= BigInteger.valueOf(50000L)) {
+                                            clicks -= BigInteger.valueOf(50000L)
                                             customBought = true
                                             prefs.edit().putString("clicks", clicks.toString()).putBoolean("custom", true).apply()
                                         }
                                     },
                                     onBuyGradient = {
-                                        if (clicks >= BigInteger.valueOf(1000L)) {
-                                            clicks -= BigInteger.valueOf(1000L)
+                                        if (clicks >= BigInteger.valueOf(75000L)) {
+                                            clicks -= BigInteger.valueOf(75000L)
                                             gradientBought = true
                                             prefs.edit().putString("clicks", clicks.toString()).putBoolean("gradient", true).apply()
                                         }
                                     },
                                     onBuyCustomGradient = {
-                                        if (clicks >= BigInteger.valueOf(10000L)) {
-                                            clicks -= BigInteger.valueOf(10000L)
+                                        if (clicks >= BigInteger.valueOf(100000L)) {
+                                            clicks -= BigInteger.valueOf(100000L)
                                             customGradientBought = true
                                             prefs.edit().putString("clicks", clicks.toString()).putBoolean("custom_gradient", true).apply()
                                         }
@@ -1390,13 +1600,7 @@ fun GameScreen(
                                     onStart = { dailyQuestRunning = true }
                                 )
                             }
-                            "ranked" -> {
-                                WipPanel(
-                                    title = "RANKED MODE",
-                                    text = "COMING SOON",
-                                    textColor = textColor
-                                )
-                            }
+
                             "skins" -> {
                                 SkinsPanel(
                                     textColor = textColor,
@@ -1458,6 +1662,8 @@ fun GameScreen(
                                     autoclickers = autoclickers,
                                     autoSpeedLevel = autoSpeedLevel,
                                     clickMultiplier = clickMultiplier,
+                                    numberFormat = numberFormat,
+                                    numberDecimals = numberDecimals,
                                     onBuyAutoclickers = { amount ->
                                         var total = BigInteger.ZERO
                                         repeat(amount.coerceIn(1, 1000)) { index ->
@@ -1573,17 +1779,20 @@ fun GameScreen(
                 customSoundBought = customSoundBought,
                 customImageUri = customImageUri,
                 customSoundUri = customSoundUri,
+                customButtonBought = customButtonBought,
+                customButtonUri = customButtonUri,
+                customButtonEnabled = customButtonEnabled,
                 clicks = clicks,
                 onBuyImage = {
-                    if (!customImageBought && clicks >= BigInteger.valueOf(20000L)) {
-                        clicks -= BigInteger.valueOf(20000L)
+                    if (!customImageBought && clicks >= BigInteger("1000000000000000000")) {
+                        clicks -= BigInteger("1000000000000000000")
                         customImageBought = true
                         prefs.edit().putString("clicks", clicks.toString()).putBoolean("custom_image_bought", true).apply()
                     }
                 },
                 onBuySound = {
-                    if (!customSoundBought && clicks >= BigInteger.valueOf(30000L)) {
-                        clicks -= BigInteger.valueOf(30000L)
+                    if (!customSoundBought && clicks >= BigInteger("1000000000000000")) {
+                        clicks -= BigInteger("1000000000000000")
                         customSoundBought = true
                         prefs.edit().putString("clicks", clicks.toString()).putBoolean("custom_sound_bought", true).apply()
                     }
@@ -1593,6 +1802,18 @@ fun GameScreen(
                 },
                 onChooseSound = {
                     soundPicker.launch(arrayOf("audio/*"))
+                },
+                onBuyButton = {
+                    if (!customButtonBought && clicks >= BigInteger("1000000000000000000")) {
+                        clicks -= BigInteger("1000000000000000000")
+                        customButtonBought = true
+                        prefs.edit().putString("clicks", clicks.toString()).putBoolean("custom_button_bought", true).apply()
+                    }
+                },
+                onChooseButton = { buttonPicker.launch(arrayOf("image/*")) },
+                onCustomButtonEnabledChange = { enabled ->
+                    customButtonEnabled = enabled
+                    prefs.edit().putBoolean("custom_button_enabled", enabled).apply()
                 },
                 customBackgroundEnabled = customBackgroundEnabled,
                 customSoundEnabled = customSoundEnabled,
@@ -1644,6 +1865,7 @@ fun GameScreen(
                                 if (result == null) {
                                     accountUsername = username.trim()
                                     accountEmail = email.trim()
+                                    isAdmin = cloudCheckAdmin(prefs)
                                     accountAvatarUri = null
                                 }
                                 result
@@ -1656,8 +1878,11 @@ fun GameScreen(
                     if (error == null && username != null) {
                         accountUsername = username
                         accountEmail = email.trim()
+                        isAdmin = cloudCheckAdmin(prefs)
                         accountBadgeText = prefs.getString("account_badge_text", null)
                         accountBadgeColor = prefs.getString("account_badge_color", null)
+                        rankedElo = prefs.getInt("ranked_elo", 0)
+                        rankedMatches = prefs.getInt("ranked_matches", 0)
                         accountAvatarUri = null
                         val cloudSave = cloudLoadGame(prefs)
                         if (cloudSave != null) {
@@ -1675,46 +1900,44 @@ fun GameScreen(
                 onLogoutAccount = {
                     accountUsername = null
                     accountEmail = null
+                    isAdmin = false
                     accountBadgeText = null
                     accountBadgeColor = null
                     accountAvatarUri = null
+                    rankedElo = 0
+                    rankedMatches = 0
                     prefs.edit()
                         .remove("account_logged_username")
                         .remove("account_email")
                         .remove("cloud_access_token")
                         .remove("cloud_refresh_token")
                         .remove("cloud_user_id")
+                        .remove("ranked_elo")
+                        .remove("ranked_matches")
                         .apply()
                 },
-                adminUnlocked = adminUnlocked,
-                onAdminUnlock = { key ->
-                    if (key == ADMIN_ACCESS_KEY) {
-                        adminUnlocked = true
-                        prefs.edit().putBoolean("admin_unlocked", true).apply()
-                        true
-                    } else false
-                },
+                isAdmin = isAdmin,
                 onAdminAddClicks = { amount ->
-                    if (adminUnlocked && amount.signum() > 0) {
+                    if (isAdmin && amount.signum() > 0) {
                         clicks += amount
                         prefs.edit().putString("clicks", clicks.toString()).apply()
                     }
                 },
                 onAdminRevertClicks = { amount ->
-                    if (adminUnlocked && amount.signum() > 0) {
+                    if (isAdmin && amount.signum() > 0) {
                         clicks = (clicks - amount).max(BigInteger.ZERO)
                         prefs.edit().putString("clicks", clicks.toString()).apply()
                     }
                 },
                 onAdminSetReward = { reward ->
-                    if (adminUnlocked) {
+                    if (isAdmin) {
                         dailyRewardOverride = reward.coerceIn(0, 100)
                         prefs.edit().putInt("daily_reward_override", dailyRewardOverride).apply()
                     }
                 },
                 onAdminSetDuration = { duration ->
-                    if (adminUnlocked) {
-                        dailyDurationOverride = duration.coerceIn(5, 50)
+                    if (isAdmin) {
+                        dailyDurationOverride = duration.coerceIn(10, 55)
                         val error = dailyError
                         dailyDuration = dailyDurationOverride
                         dailyTarget = (dailyDuration * 10 + error).coerceIn(50, 500)
@@ -1722,7 +1945,7 @@ fun GameScreen(
                     }
                 },
                 onAdminResetQuestSettings = {
-                    if (adminUnlocked) {
+                    if (isAdmin) {
                         prefs.edit().remove("daily_duration_override").remove("daily_reward_override").apply()
                         dailyDurationOverride = -1
                         dailyRewardOverride = -1
@@ -1733,7 +1956,7 @@ fun GameScreen(
                     }
                 },
                 onAdminGrantSkin = { skin ->
-                    if (adminUnlocked) {
+                    if (isAdmin) {
                         when (skin) {
                             "blue" -> blueBought = true
                             "red" -> redBought = true
@@ -1756,11 +1979,11 @@ fun GameScreen(
                             .apply()
                     }
                 },
-                onAdminSetBadge = { email, badgeText, badgeColor ->
-                    if (!adminUnlocked) "Admin panel is locked"
+                onAdminSetBadge = { username, badgeText, badgeColor ->
+                    if (!isAdmin) "Admin panel is locked"
                     else {
-                        val result = cloudSetBadge(email, badgeText, badgeColor, prefs)
-                        if (result == null && email.trim().equals(accountEmail?.trim(), ignoreCase = true)) {
+                        val result = cloudSetBadge(username, badgeText, badgeColor, prefs)
+                        if (result == null && username.trim().equals(accountUsername?.trim(), ignoreCase = true)) {
                             accountBadgeText = badgeText.trim()
                             accountBadgeColor = badgeColor.trim()
                             prefs.edit().putString("account_badge_text", accountBadgeText).putString("account_badge_color", accountBadgeColor).apply()
@@ -1768,8 +1991,11 @@ fun GameScreen(
                         result
                     }
                 },
+                onAdminSetAccountStatus = { username, status, minutes ->
+                    if (!isAdmin) "Admin panel is locked" else cloudSetAccountStatus(username, status, minutes, prefs)
+                },
                 onAdminResetDaily = {
-                    if (adminUnlocked) {
+                    if (isAdmin) {
                         generateDailyQuest(prefs)
                         val quest = ensureDailyQuest(prefs)
                         dailyDuration = quest.first
@@ -1782,6 +2008,58 @@ fun GameScreen(
                 },
                 onBack = {
                     settingsOpen = false
+                }
+            )
+        }
+
+        // =====================================================
+        // RANKED MODE
+        // =====================================================
+
+        AnimatedVisibility(
+            visible = panel == "ranked",
+            enter = fadeIn(animationSpec = tween(450)) +
+                slideInVertically(initialOffsetY = { it / 8 }, animationSpec = tween(450)),
+            exit = fadeOut(animationSpec = tween(250))
+        ) {
+            RankedModeScreen(
+                textColor = textColor,
+                accentColor = accentColor,
+                loggedIn = accountUsername != null,
+                username = accountUsername,
+                elo = rankedElo,
+                rankedMatches = rankedMatches,
+                resultGain = rankedResultGain,
+                onStartBattle = { mode ->
+                    rankedBattleMode = mode
+                    rankedResultGain = 0
+                    rankedBattleRunning = true
+                },
+                onClose = { panel = null }
+            )
+        }
+
+        if (rankedBattleRunning && accountUsername != null) {
+            RankedBattleRunner(
+                mode = rankedBattleMode,
+                textColor = textColor,
+                accentColor = accentColor,
+                resultGain = rankedResultGain,
+                onClickSound = { if (customSoundEnabled) playCustomSound(context, customSoundUri) },
+                onMatchComplete = { won ->
+                    val result = cloudRecordRankedResult(prefs, won, rankedBattleMode)
+                    if (result != null) {
+                        rankedElo = result.first
+                        rankedMatches = result.second
+                        rankedResultGain = result.third
+                    } else {
+                        rankedResultGain = 0
+                    }
+                },
+                onExit = {
+                    rankedBattleRunning = false
+                    rankedResultGain = 0
+                    panel = "ranked"
                 }
             )
         }
@@ -1832,6 +2110,525 @@ fun GameScreen(
             )
         }
 
+    }
+}
+
+// =============================================================
+// RANKED MODE
+// =============================================================
+
+@Composable
+fun RankedModeScreen(
+    textColor: Color,
+    accentColor: Color,
+    loggedIn: Boolean,
+    username: String?,
+    elo: Int,
+    rankedMatches: Int,
+    resultGain: Int,
+    onStartBattle: (String) -> Unit,
+    onClose: () -> Unit
+) {
+    var section by remember { mutableStateOf("battle") }
+    var leaderboardTab by remember { mutableStateOf("top100") }
+    var leaderboard by remember { mutableStateOf<List<RankedLeaderboardEntry>>(emptyList()) }
+    var loadingLeaderboard by remember { mutableStateOf(false) }
+    var battleResult by remember { mutableStateOf<Boolean?>(null) }
+
+    val context = LocalContext.current
+    val prefs = remember {
+        context.getSharedPreferences("clckr", Context.MODE_PRIVATE)
+    }
+
+    LaunchedEffect(section, leaderboardTab, loggedIn) {
+        if (loggedIn && section == "leaderboard") {
+            loadingLeaderboard = true
+            leaderboard = cloudLoadRankedLeaderboard(prefs, leaderboardTab == "top100")
+            loadingLeaderboard = false
+        }
+    }
+
+    BackHandler {
+        onClose()
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(start = 20.dp, end = 20.dp, top = 55.dp, bottom = 30.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "RANKED MODE",
+                color = textColor,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f)
+            )
+            if (loggedIn) {
+                Column(horizontalAlignment = Alignment.End) {
+                    Text("ELO $elo", color = textColor, fontWeight = FontWeight.Bold)
+                    Text("$rankedMatches MATCHES", color = textColor.copy(alpha = .6f), fontSize = 10.sp)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(25.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (loggedIn) {
+                SettingsTab(
+                    text = "BATTLE",
+                    selected = section == "battle",
+                    textColor = textColor,
+                    accentColor = accentColor,
+                    onClick = { section = "battle" }
+                )
+                SettingsTab(
+                    text = "LEADERBOARD",
+                    selected = section == "leaderboard",
+                    textColor = textColor,
+                    accentColor = accentColor,
+                    onClick = { section = "leaderboard" }
+                )
+            } else {
+                RankedLockedTab("BATTLE", textColor)
+                RankedLockedTab("LEADERBOARD", textColor)
+            }
+        }
+
+        Spacer(Modifier.height(25.dp))
+
+        if (!loggedIn) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("🔒", fontSize = 54.sp, color = textColor.copy(alpha = .45f))
+                    Spacer(Modifier.height(12.dp))
+                    Text("ACCOUNT REQUIRED", color = textColor, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Log in or create a clckr. account to use Ranked Mode.",
+                        color = textColor.copy(alpha = .6f),
+                        fontSize = 14.sp
+                    )
+                }
+            }
+        } else if (section == "battle") {
+            Column(
+                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("PVE BATTLE", color = textColor, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text("Battle against a bot. Your ELO is saved to your account.", color = textColor.copy(alpha = .65f), fontSize = 13.sp)
+                Spacer(Modifier.height(25.dp))
+
+                RankedModeChoice(
+                    title = "EASY",
+                    details = "100 clicks · 20 seconds",
+                    accentColor = accentColor,
+                    textColor = textColor,
+                    onClick = { onStartBattle("easy") }
+                )
+                RankedModeChoice(
+                    title = "MEDIUM",
+                    details = "200 clicks · 35 seconds",
+                    accentColor = accentColor,
+                    textColor = textColor,
+                    onClick = { onStartBattle("medium") }
+                )
+                RankedModeChoice(
+                    title = "HARD",
+                    details = "300 clicks · 30 seconds",
+                    accentColor = accentColor,
+                    textColor = textColor,
+                    onClick = { onStartBattle("hard") }
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                SettingsTab(
+                    text = "TOP 100",
+                    selected = leaderboardTab == "top100",
+                    textColor = textColor,
+                    accentColor = accentColor,
+                    onClick = { leaderboardTab = "top100" }
+                )
+                SettingsTab(
+                    text = "GLOBAL",
+                    selected = leaderboardTab == "global",
+                    textColor = textColor,
+                    accentColor = accentColor,
+                    onClick = { leaderboardTab = "global" }
+                )
+            }
+            Spacer(Modifier.height(15.dp))
+
+            if (loadingLeaderboard) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = accentColor)
+                }
+            } else if (leaderboard.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No ranked players yet.", color = textColor.copy(alpha = .6f))
+                }
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    leaderboard.forEachIndexed { index, player ->
+                        val isMe = player.username.equals(username, ignoreCase = true)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(
+                                    if (isMe) accentColor.copy(alpha = .12f)
+                                    else MaterialTheme.colorScheme.surfaceVariant
+                                )
+                                .border(
+                                    1.dp,
+                                    if (isMe) accentColor.copy(alpha = .45f)
+                                    else MaterialTheme.colorScheme.outline.copy(alpha = .25f),
+                                    RoundedCornerShape(14.dp)
+                                )
+                                .padding(horizontal = 14.dp, vertical = 11.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "#${index + 1}",
+                                color = textColor.copy(alpha = .55f),
+                                modifier = Modifier.width(45.dp),
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                player.username,
+                                color = textColor,
+                                fontWeight = if (isMe) FontWeight.Bold else FontWeight.Normal,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text("${player.elo} ELO", color = textColor, fontWeight = FontWeight.Bold)
+                                Text("${player.matches} matches", color = textColor.copy(alpha = .55f), fontSize = 10.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RowScope.RankedLockedTab(
+    text: String,
+    textColor: Color
+) {
+    Box(
+        modifier = Modifier
+            .weight(1f)
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .45f))
+            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = .2f), RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("🔒", fontSize = 12.sp)
+            Spacer(Modifier.width(5.dp))
+            Text(text, color = textColor.copy(alpha = .4f), fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun RankedModeChoice(
+    title: String,
+    details: String,
+    accentColor: Color,
+    textColor: Color,
+    onClick: () -> Unit
+) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp).height(76.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            contentColor = textColor
+        ),
+        border = BorderStroke(1.dp, accentColor.copy(alpha = .45f))
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(title, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+            Text(details, fontSize = 12.sp, color = textColor.copy(alpha = .65f))
+        }
+    }
+}
+
+@Composable
+fun RankedBattleRunner(
+    mode: String,
+    textColor: Color,
+    accentColor: Color,
+    resultGain: Int,
+    onClickSound: () -> Unit,
+    onMatchComplete: suspend (Boolean) -> Unit,
+    onExit: () -> Unit
+) {
+    val (target, duration) = when (mode) {
+        "medium" -> 200 to 35
+        "hard" -> 300 to 30
+        else -> 100 to 20
+    }
+
+    var phase by remember { mutableStateOf("countdown") }
+    var playerClicks by remember { mutableIntStateOf(0) }
+    var botClicks by remember { mutableIntStateOf(0) }
+    var playerClickWindowStart by remember { mutableLongStateOf(0L) }
+    var playerClickWindowCount by remember { mutableIntStateOf(0) }
+    var remaining by remember { mutableIntStateOf(duration) }
+    var finished by remember { mutableStateOf(false) }
+    var won by remember { mutableStateOf(false) }
+    var transitionAlpha by remember { mutableFloatStateOf(1f) }
+    var resultShown by remember { mutableStateOf(false) }
+    var matchReported by remember { mutableStateOf(false) }
+    var exiting by remember { mutableStateOf(false) }
+    val animatedGain = remember { Animatable(0f) }
+
+    LaunchedEffect(resultGain, resultShown) {
+        if (resultShown) {
+            animatedGain.snapTo(0f)
+            animatedGain.animateTo(
+                resultGain.toFloat(),
+                animationSpec = tween(
+                    durationMillis = maxOf(350, resultGain * 80),
+                    easing = FastOutSlowInEasing
+                )
+            )
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        transitionAlpha = 1f
+        var elapsed = 0L
+        while (elapsed < 1000L) {
+            delay(16L)
+            elapsed += 16L
+            transitionAlpha = (1f - elapsed / 1000f).coerceIn(0f, 1f)
+        }
+        transitionAlpha = 0f
+        phase = "countdown2"
+        delay(1000L)
+        phase = "countdown1"
+        delay(1000L)
+        phase = "active"
+
+        val end = System.currentTimeMillis() + duration * 1000L
+        var lastBotTick = System.currentTimeMillis()
+        val (botMinCps, botMaxCps) = when (mode) {
+            "easy" -> 18 to 20
+            "medium" -> 14 to 18
+            else -> 10 to 14
+        }
+        var nextBotDelay = Random.nextLong(1000L / botMaxCps, 1000L / botMinCps + 1L)
+
+        while (!finished) {
+            val now = System.currentTimeMillis()
+            remaining = ((end - now + 999L) / 1000L).toInt().coerceAtLeast(0)
+
+            if (playerClicks >= target) {
+                won = true
+                finished = true
+            } else if (botClicks >= target) {
+                won = false
+                finished = true
+            } else if (remaining <= 0) {
+                won = playerClicks >= botClicks
+                finished = true
+            } else {
+                if (now - lastBotTick >= nextBotDelay) {
+                    lastBotTick = now
+                    if (botClicks < target) {
+                        botClicks += 1
+                    }
+                    nextBotDelay = Random.nextLong(1000L / botMaxCps, 1000L / botMinCps + 1L)
+                }
+            }
+
+            if (finished) {
+                delay(700L)
+                transitionAlpha = 0f
+                if (!matchReported) {
+                    matchReported = true
+                    onMatchComplete(won)
+                }
+                resultShown = true
+                break
+            }
+            delay(50L)
+        }
+    }
+
+    if (resultShown) {
+        BackHandler { }
+        Box(
+            modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    if (won) "You Won!" else "You Lost!",
+                    color = textColor,
+                    fontSize = 32.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(12.dp))
+                val displayedDelta = animatedGain.value.toInt()
+                val eloSign = if (displayedDelta > 0) "+" else ""
+                Text(
+                    "ELO: $eloSign$displayedDelta",
+                    color = textColor,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(30.dp))
+                Button(
+                    onClick = {
+                        if (!exiting) {
+                            exiting = true
+                            onExit()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = accentColor, contentColor = accentTextColor(accentColor))
+                ) {
+                    Text("BACK TO BATTLE")
+                }
+            }
+            if (transitionAlpha > 0f) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.background.copy(alpha = transitionAlpha))
+                )
+            }
+        }
+    } else {
+        BackHandler { }
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color(0xFF181818)),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(start = 24.dp, end = 24.dp, top = 45.dp, bottom = 30.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("${remaining}s", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+
+                Spacer(Modifier.height(16.dp))
+
+                RankedBattleButton(
+                    title = "BOT",
+                    value = botClicks,
+                    target = target,
+                    textColor = Color.White,
+                    accentColor = accentColor.copy(alpha = .55f),
+                    enabled = false,
+                    onClick = {},
+                    modifier = Modifier.size(220.dp)
+                )
+
+                Spacer(Modifier.weight(1f))
+
+                if (phase.startsWith("countdown")) {
+                    val number = when (phase) {
+                        "countdown" -> "3"
+                        "countdown2" -> "2"
+                        else -> "1"
+                    }
+                    Box(
+                        modifier = Modifier.size(220.dp).clip(CircleShape).background(accentColor),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(number, color = accentTextColor(accentColor), fontSize = 56.sp, fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    RankedBattleButton(
+                        title = "YOU",
+                        value = playerClicks,
+                        target = target,
+                        textColor = Color.White,
+                        accentColor = accentColor,
+                        enabled = !finished,
+                        onClick = {
+                            if (!finished) {
+                                val now = System.currentTimeMillis()
+                                if (now - playerClickWindowStart >= 1000L) {
+                                    playerClickWindowStart = now
+                                    playerClickWindowCount = 0
+                                }
+                                if (playerClickWindowCount < 50) {
+                                    playerClickWindowCount += 1
+                                    playerClicks++
+                                    onClickSound()
+                                }
+                            }
+                        },
+                        modifier = Modifier.size(220.dp)
+                    )
+                }
+            }
+
+            if (transitionAlpha > 0f) {
+                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = transitionAlpha)))
+            }
+        }
+    }
+}
+
+@Composable
+private fun RankedBattleButton(
+    title: String,
+    value: Int,
+    target: Int,
+    textColor: Color,
+    accentColor: Color,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier
+) {
+    Box(
+        modifier = modifier
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surface)
+            .border(3.dp, accentColor, CircleShape)
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(title, color = textColor, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text(value.toString(), color = textColor, fontSize = 34.sp, fontWeight = FontWeight.Bold)
+            Text("/ $target", color = textColor.copy(alpha = .55f), fontSize = 12.sp)
+        }
     }
 }
 
@@ -2010,15 +2807,7 @@ fun BottomNavigationBar(
                             fontWeight = FontWeight.Medium,
                             fontSize = 14.sp
                         )
-                        if (id == "ranked") {
-                            Spacer(Modifier.weight(1f))
-                            Text(
-                                "COMING SOON",
-                                color = textColor.copy(alpha = .55f),
-                                fontSize = 8.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+
                     }
                 }
             }
@@ -2067,7 +2856,7 @@ fun BottomNavigationBar(
                 ) {
                     Text(
                         "⋮",
-                        color = if (selectedIndex == 0) Color.White else textColor,
+                        color = if (selectedIndex == 0) accentTextColor(accentColor) else textColor,
                         fontSize = 30.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -2085,7 +2874,7 @@ fun BottomNavigationBar(
                 ) {
                     Text(
                         "●",
-                        color = if (selectedIndex == 1) Color.White else textColor,
+                        color = if (selectedIndex == 1) accentTextColor(accentColor) else textColor,
                         fontSize = 24.sp
                     )
                 }
@@ -2102,7 +2891,7 @@ fun BottomNavigationBar(
                 ) {
                     Text(
                         "⚙",
-                        color = if (selectedIndex == 2) Color.White else textColor,
+                        color = if (selectedIndex == 2) accentTextColor(accentColor) else textColor,
                         fontSize = 25.sp
                     )
                 }
@@ -2126,11 +2915,17 @@ fun SettingsScreen(
     customSoundBought: Boolean,
     customImageUri: String?,
     customSoundUri: String?,
+    customButtonBought: Boolean,
+    customButtonUri: String?,
+    customButtonEnabled: Boolean,
     clicks: BigInteger,
     onBuyImage: () -> Unit,
     onBuySound: () -> Unit,
     onChooseImage: () -> Unit,
     onChooseSound: () -> Unit,
+    onBuyButton: () -> Unit,
+    onChooseButton: () -> Unit,
+    onCustomButtonEnabledChange: (Boolean) -> Unit,
     customBackgroundEnabled: Boolean,
     customSoundEnabled: Boolean,
     clickAnimationEnabled: Boolean,
@@ -2150,8 +2945,7 @@ fun SettingsScreen(
     onRegisterAccount: suspend (String, String, String) -> String?,
     onLoginAccount: suspend (String, String) -> String?,
     onLogoutAccount: () -> Unit,
-    adminUnlocked: Boolean,
-    onAdminUnlock: (String) -> Boolean,
+    isAdmin: Boolean,
     onAdminAddClicks: (BigInteger) -> Unit,
     onAdminRevertClicks: (BigInteger) -> Unit,
     onAdminSetReward: (Int) -> Unit,
@@ -2159,6 +2953,7 @@ fun SettingsScreen(
     onAdminResetQuestSettings: () -> Unit,
     onAdminGrantSkin: (String) -> Unit,
     onAdminSetBadge: suspend (String, String, String) -> String?,
+    onAdminSetAccountStatus: suspend (String, String, Int?) -> String?,
     onAdminResetDaily: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -2323,6 +3118,11 @@ fun SettingsScreen(
             Text("Choose the color used by buttons and navigation.", color = textColor)
             Spacer(Modifier.height(15.dp))
 
+            ThemeOption("Default", theme == "default", textColor, accentColor) {
+                onThemeChange("default")
+            }
+            Spacer(Modifier.height(8.dp))
+
             ColorWheel(
                 selectedColor = accentColor,
                 onColorChange = onAccentColorChange
@@ -2479,9 +3279,6 @@ fun SettingsScreen(
                             Column(Modifier.weight(1f)) {
                                 Text("NAME", color = textColor.copy(alpha = .5f), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                                 Text(accountUsername, color = textColor, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                                if (!accountEmail.isNullOrBlank()) {
-                                    Text(accountEmail!!, color = textColor.copy(alpha = .6f), fontSize = 11.sp)
-                                }
                                 if (!accountBadgeText.isNullOrBlank()) {
                                     val badgeColor = accountBadgeColor?.let { runCatching { Color(AndroidColor.parseColor(it)) }.getOrNull() } ?: accentColor
                                     Spacer(Modifier.height(5.dp))
@@ -2609,8 +3406,8 @@ fun SettingsScreen(
 
             if (!customImageBought) {
                 AccentButton(
-                    text = "UNLOCK — 20 000 CLICKS",
-                    enabled = clicks >= BigInteger.valueOf(20000L),
+                    text = "UNLOCK — 1 QUINTILLION CLICKS",
+                    enabled = clicks >= BigInteger("1000000000000000000"),
                     accentColor = accentColor,
                     onClick = onBuyImage
                 )
@@ -2643,8 +3440,8 @@ fun SettingsScreen(
 
             if (!customSoundBought) {
                 AccentButton(
-                    text = "UNLOCK — 30 000 CLICKS",
-                    enabled = clicks >= BigInteger.valueOf(30000L),
+                    text = "UNLOCK — 1 QUADRILLION CLICKS",
+                    enabled = clicks >= BigInteger("1000000000000000"),
                     accentColor = accentColor,
                     onClick = onBuySound
                 )
@@ -2664,6 +3461,41 @@ fun SettingsScreen(
                 onCheckedChange = onCustomSoundEnabledChange
             )
 
+            Spacer(Modifier.height(30.dp))
+
+            // =====================================================
+            // CUSTOM BUTTON
+            // =====================================================
+
+            Text("CUSTOM BUTTON", color = textColor, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(6.dp))
+            Text("Replace the main click button with your own image.", color = textColor)
+            Spacer(Modifier.height(12.dp))
+            if (!customButtonBought) {
+                AccentButton(
+                    text = "UNLOCK — 1 QUINTILLION CLICKS",
+                    enabled = clicks >= BigInteger("1000000000000000000"),
+                    accentColor = accentColor,
+                    onClick = onBuyButton
+                )
+            } else {
+                AccentButton(
+                    text = if (customButtonUri == null) "CHOOSE BUTTON IMAGE" else "CHANGE BUTTON IMAGE",
+                    enabled = true,
+                    accentColor = accentColor,
+                    onClick = onChooseButton
+                )
+                Spacer(Modifier.height(8.dp))
+                SettingSwitchRow(
+                    title = "ENABLE CUSTOM BUTTON",
+                    checked = customButtonEnabled && customButtonUri != null,
+                    textColor = textColor,
+                    onCheckedChange = { enabled ->
+                        onCustomButtonEnabledChange(enabled)
+                    }
+                )
+            }
+
             Spacer(Modifier.height(35.dp))
 
             // =====================================================
@@ -2675,26 +3507,8 @@ fun SettingsScreen(
             Text("Contest/admin tools. Ranked mode is never modified by these tools.", color = textColor)
             Spacer(Modifier.height(12.dp))
 
-            if (!adminUnlocked) {
-                var adminKey by remember { mutableStateOf("") }
-                var invalidKey by remember { mutableStateOf(false) }
-                OutlinedTextField(
-                    value = adminKey,
-                    onValueChange = { adminKey = it.uppercase().take(19) },
-                    label = { Text("ACCESS KEY") },
-                    singleLine = true,
-                    isError = invalidKey,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                AccentButton(
-                    text = "UNLOCK ADMIN PANEL",
-                    enabled = adminKey.length == 19,
-                    accentColor = accentColor,
-                    onClick = {
-                        invalidKey = !onAdminUnlock(adminKey)
-                    }
-                )
+            if (!isAdmin) {
+                Text("Admin access is controlled by the server.", color = textColor.copy(alpha = .6f), fontSize = 12.sp)
             } else {
                 AdminPanel(
                     textColor = textColor,
@@ -2706,6 +3520,7 @@ fun SettingsScreen(
                     onResetQuestSettings = onAdminResetQuestSettings,
                     onGrantSkin = onAdminGrantSkin,
                     onSetBadge = onAdminSetBadge,
+                    onSetAccountStatus = onAdminSetAccountStatus,
                     onResetDaily = onAdminResetDaily
                 )
             }
@@ -2747,12 +3562,12 @@ fun AccentButton(
         modifier = Modifier.fillMaxWidth(),
         colors = ButtonDefaults.buttonColors(
             containerColor = accentColor,
-            contentColor = Color.White,
+            contentColor = accentTextColor(accentColor),
             disabledContainerColor = accentColor.copy(alpha = 0.35f),
-            disabledContentColor = Color.White.copy(alpha = 0.7f)
+            disabledContentColor = accentTextColor(accentColor).copy(alpha = 0.7f)
         )
     ) {
-        Text(text = text, color = Color.White)
+        Text(text = text, color = accentTextColor(accentColor))
     }
 }
 
@@ -2837,7 +3652,7 @@ fun RowScope.SettingsTab(
     ) {
         Text(
             text = text,
-            color = if (selected) Color.White else textColor,
+            color = if (selected) accentTextColor(accentColor) else textColor,
             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
         )
     }
@@ -3204,6 +4019,8 @@ fun ShopPanel(
     customGradientBought: Boolean,
     ownedShopSkins: Set<String>,
     ownedAccessories: Set<String>,
+    numberFormat: String,
+    numberDecimals: Int,
     onBuyBlue: () -> Unit,
     onBuyRed: () -> Unit,
     onBuyYellow: () -> Unit,
@@ -3255,7 +4072,7 @@ fun ShopPanel(
                         .clickable { tab = id }.padding(vertical = 10.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(title, color = if (tab == id) Color.White else textColor, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text(title, color = if (tab == id) accentTextColor(MaterialTheme.colorScheme.primary) else textColor, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }
@@ -3263,19 +4080,19 @@ fun ShopPanel(
 
         when (tab) {
             "colors" -> {
-                ShopItem("Blue", 100, blueBought, clicks, textColor, onBuyBlue)
-                ShopItem("Red", 250, redBought, clicks, textColor, onBuyRed)
-                ShopItem("Yellow", 500, yellowBought, clicks, textColor, onBuyYellow)
-                ShopItem("Green", 750, greenBought, clicks, textColor, onBuyGreen)
-                ShopItem("Custom Color", 5000, customBought, clicks, textColor, onBuyCustom)
-                ShopItem("Gradient", 1000, gradientBought, clicks, textColor, onBuyGradient)
-                ShopItem("Custom Gradient", 10000, customGradientBought, clicks, textColor, onBuyCustomGradient)
+                ShopItem("Blue", BigInteger("10000"), blueBought, clicks, textColor, numberFormat, numberDecimals, onBuyBlue)
+                ShopItem("Red", BigInteger("20000"), redBought, clicks, textColor, numberFormat, numberDecimals, onBuyRed)
+                ShopItem("Yellow", BigInteger("30000"), yellowBought, clicks, textColor, numberFormat, numberDecimals, onBuyYellow)
+                ShopItem("Green", BigInteger("40000"), greenBought, clicks, textColor, numberFormat, numberDecimals, onBuyGreen)
+                ShopItem("Custom Color", BigInteger("50000"), customBought, clicks, textColor, numberFormat, numberDecimals, onBuyCustom)
+                ShopItem("Gradient", BigInteger("75000"), gradientBought, clicks, textColor, numberFormat, numberDecimals, onBuyGradient)
+                ShopItem("Custom Gradient", BigInteger("100000"), customGradientBought, clicks, textColor, numberFormat, numberDecimals, onBuyCustomGradient)
             }
             "skins" -> {
                 shopSkins.forEach { (id, price) ->
                     CosmeticShopItem(
                         name = skinNames[id] ?: id, price = price, bought = ownedShopSkins.contains(id),
-                        clicks = clicks, textColor = textColor,
+                        clicks = clicks, textColor = textColor, numberFormat = numberFormat, numberDecimals = numberDecimals,
                         onBuy = { onBuyShopSkin(id, price) }
                     )
                 }
@@ -3302,10 +4119,12 @@ fun ShopPanel(
 @Composable
 fun ShopItem(
     name: String,
-    price: Int,
+    price: BigInteger,
     bought: Boolean,
     clicks: BigInteger,
     textColor: Color,
+    numberFormat: String,
+    numberDecimals: Int,
     onBuy: () -> Unit
 ) {
 
@@ -3317,13 +4136,13 @@ fun ShopItem(
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(name, color = textColor, fontWeight = FontWeight.Bold)
-            Text(if (bought) "Owned" else "$price clicks", color = textColor)
+            Text(if (bought) "Owned" else "${formatClicks(price, numberFormat, numberDecimals)} clicks", color = textColor)
         }
 
         if (!bought) {
             AccentButtonSmall(
                 text = "BUY",
-                enabled = clicks >= BigInteger.valueOf(price.toLong()),
+                enabled = clicks >= price,
                 onClick = onBuy
             )
         } else {
@@ -3339,12 +4158,14 @@ fun CosmeticShopItem(
     bought: Boolean,
     clicks: BigInteger,
     textColor: Color,
+    numberFormat: String,
+    numberDecimals: Int,
     onBuy: () -> Unit
 ) {
     Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(name, color = textColor, fontWeight = FontWeight.Bold)
-            Text(if (bought) "Owned" else "${price.toString()} clicks", color = textColor)
+            Text(if (bought) "Owned" else "${formatClicks(price, numberFormat, numberDecimals)} clicks", color = textColor)
         }
         if (!bought) {
             AccentButtonSmall("BUY", clicks >= price, onBuy)
@@ -3370,12 +4191,12 @@ fun AccentButtonSmall(
         enabled = enabled,
         colors = ButtonDefaults.buttonColors(
             containerColor = MaterialTheme.colorScheme.primary,
-            contentColor = Color.White,
+            contentColor = accentTextColor(MaterialTheme.colorScheme.primary),
             disabledContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
-            disabledContentColor = Color.White.copy(alpha = 0.7f)
+            disabledContentColor = accentTextColor(MaterialTheme.colorScheme.primary).copy(alpha = 0.7f)
         )
     ) {
-        Text(text = text, color = Color.White)
+        Text(text = text, color = accentTextColor(MaterialTheme.colorScheme.primary))
     }
 }
 
@@ -3673,12 +4494,12 @@ fun OwnedColorPicker(
     greenBought: Boolean,
     onColorChange: (Color) -> Unit
 ) {
-    val colors = listOfNotNull(
-        if (blueBought) "Blue" to Color.Blue else null,
-        if (redBought) "Red" to Color.Red else null,
-        if (yellowBought) "Yellow" to Color.Yellow else null,
-        if (greenBought) "Green" to Color.Green else null
-    )
+    val colors = buildList<Pair<String, Color>> {
+        if (blueBought) add("Blue" to Color.Blue)
+        if (redBought) add("Red" to Color.Red)
+        if (yellowBought) add("Yellow" to Color.Yellow)
+        if (greenBought) add("Green" to Color.Green)
+    }
 
     if (colors.isEmpty()) {
         Text("Buy at least one color first.", color = textColor.copy(alpha = 0.7f))
@@ -3722,12 +4543,13 @@ fun AdminPanel(
     onResetQuestSettings: () -> Unit,
     onGrantSkin: (String) -> Unit,
     onSetBadge: suspend (String, String, String) -> String?,
+    onSetAccountStatus: suspend (String, String, Int?) -> String?,
     onResetDaily: () -> Unit
 ) {
     var clickAmount by remember { mutableStateOf("") }
     var rewardAmount by remember { mutableStateOf("") }
     var durationAmount by remember { mutableStateOf("") }
-    var badgeEmail by remember { mutableStateOf("") }
+    var badgeUsername by remember { mutableStateOf("") }
     var badgeText by remember { mutableStateOf("") }
     var badgeColor by remember { mutableStateOf("#8B5CF6") }
     var badgeStatus by remember { mutableStateOf<String?>(null) }
@@ -3795,7 +4617,7 @@ fun AdminPanel(
         modifier = Modifier.fillMaxWidth()
     )
     Spacer(Modifier.height(8.dp))
-    val previewDuration = durationAmount.toIntOrNull()?.coerceIn(5, 50) ?: 5
+    val previewDuration = durationAmount.toIntOrNull()?.coerceIn(1, 45) ?: 1
     val previewTarget = (previewDuration * 10).coerceIn(50, 500)
     val previewReward = rewardAmount.toIntOrNull()?.coerceIn(0, 100) ?: 50
     Text("Preview: $previewTarget clicks in $previewDuration seconds", color = textColor)
@@ -3803,12 +4625,14 @@ fun AdminPanel(
     Spacer(Modifier.height(8.dp))
     AccentButton(
         text = "SET TIME",
-        enabled = durationAmount.toIntOrNull()?.let { it in 5..50 } == true,
+        enabled = durationAmount.toIntOrNull()?.let { it in 1..45 } == true,
         accentColor = accentColor,
         onClick = { durationAmount.toIntOrNull()?.let(onSetDuration) }
     )
     Spacer(Modifier.height(8.dp))
     AccentButtonSmall("RESET QUEST SETTINGS", true, onClick = onResetQuestSettings)
+    Spacer(Modifier.height(8.dp))
+    AccentButtonSmall("RESET DAILY TIMER", true, onClick = onResetDaily)
 
     Spacer(Modifier.height(20.dp))
     Text("GRANT SKINS", color = textColor, fontWeight = FontWeight.Bold)
@@ -3834,7 +4658,7 @@ fun AdminPanel(
     Spacer(Modifier.height(20.dp))
     Text("ACCOUNT BADGES", color = textColor, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(8.dp))
-    OutlinedTextField(value = badgeEmail, onValueChange = { badgeEmail = it.take(160) }, label = { Text("EMAIL") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+    OutlinedTextField(value = badgeUsername, onValueChange = { badgeUsername = it.take(20) }, label = { Text("USERNAME") }, singleLine = true, modifier = Modifier.fillMaxWidth())
     Spacer(Modifier.height(8.dp))
     OutlinedTextField(value = badgeText, onValueChange = { badgeText = it.take(32) }, label = { Text("BADGE TEXT") }, singleLine = true, modifier = Modifier.fillMaxWidth())
     Spacer(Modifier.height(8.dp))
@@ -3843,9 +4667,9 @@ fun AdminPanel(
         badgeColor = normalized.take(7)
     }, label = { Text("BADGE COLOR (#RRGGBB)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
     Spacer(Modifier.height(8.dp))
-    AccentButtonSmall("GIVE / UPDATE BADGE", badgeEmail.contains("@") && badgeText.isNotBlank() && badgeColor.matches(Regex("#[0-9A-Fa-f]{6}")), onClick = {
+    AccentButtonSmall("GIVE / UPDATE BADGE", badgeUsername.isNotBlank() && badgeText.isNotBlank() && badgeColor.matches(Regex("#[0-9A-Fa-f]{6}")), onClick = {
         coroutineScope.launch {
-            badgeStatus = onSetBadge(badgeEmail, badgeText, badgeColor) ?: "Badge updated"
+            badgeStatus = onSetBadge(badgeUsername, badgeText, badgeColor) ?: "Badge updated"
         }
     })
     if (badgeStatus != null) {
@@ -3853,13 +4677,27 @@ fun AdminPanel(
         Text(badgeStatus!!, color = textColor.copy(alpha = .7f), fontSize = 12.sp)
     }
 
+    Spacer(Modifier.height(20.dp))
+    Text("ACCOUNT MODERATION", color = textColor, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(8.dp))
+    var moderationUsername by remember { mutableStateOf("") }
+    var suspendMinutes by remember { mutableStateOf("60") }
+    var moderationStatus by remember { mutableStateOf<String?>(null) }
+    OutlinedTextField(value = moderationUsername, onValueChange = { moderationUsername = it.take(20) }, label = { Text("USERNAME") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+    Spacer(Modifier.height(8.dp))
+    OutlinedTextField(value = suspendMinutes, onValueChange = { suspendMinutes = it.filter(Char::isDigit).take(6) }, label = { Text("SUSPEND MINUTES") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+    Spacer(Modifier.height(8.dp))
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        AccentButtonSmall("BAN", moderationUsername.isNotBlank()) { coroutineScope.launch { moderationStatus = onSetAccountStatus(moderationUsername, "banned", null) ?: "Account banned" } }
+        AccentButtonSmall("SUSPEND", moderationUsername.isNotBlank() && suspendMinutes.toIntOrNull()?.let { it > 0 } == true) { coroutineScope.launch { moderationStatus = onSetAccountStatus(moderationUsername, "suspended", suspendMinutes.toIntOrNull()) ?: "Account suspended" } }
+        AccentButtonSmall("UNBAN", moderationUsername.isNotBlank()) { coroutineScope.launch { moderationStatus = onSetAccountStatus(moderationUsername, "active", null) ?: "Account restored" } }
+    }
+    moderationStatus?.let { Text(it, color = textColor.copy(alpha = .7f), fontSize = 12.sp) }
+
     Spacer(Modifier.height(15.dp))
     Text("FUTURE TEST TOOLS", color = textColor, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(8.dp))
     Text("Factory instant build — coming later", color = textColor.copy(alpha = 0.6f))
-    Text("Daily timer reset is available below.", color = textColor.copy(alpha = 0.6f))
-    Spacer(Modifier.height(8.dp))
-    AccentButtonSmall("RESET DAILY TIMER", true, onClick = onResetDaily)
     Spacer(Modifier.height(8.dp))
     Text("Ranked mode is not affected by admin tools.", color = textColor.copy(alpha = 0.6f), fontSize = 12.sp)
 }
@@ -4068,9 +4906,9 @@ fun SkinSelectItem(
             enabled = !selected,
             colors = ButtonDefaults.buttonColors(
                 containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = Color.White,
+                contentColor = accentTextColor(MaterialTheme.colorScheme.primary),
                 disabledContainerColor = MaterialTheme.colorScheme.primary,
-                disabledContentColor = Color.White
+                disabledContentColor = accentTextColor(MaterialTheme.colorScheme.primary)
             )
         ) {
             Text(if (selected) "SELECTED" else "SELECT")
@@ -4089,6 +4927,8 @@ fun UpgradePanel(
     autoclickers: BigInteger,
     autoSpeedLevel: Int,
     clickMultiplier: Int,
+    numberFormat: String,
+    numberDecimals: Int,
     onBuyAutoclickers: (Int) -> Unit,
     onBuyAutoSpeed: (Int) -> Unit,
     onBuyMultiplier: (Int) -> Unit
@@ -4165,14 +5005,14 @@ fun UpgradePanel(
 
         val autoclickerTotal = autoclickerTotalPrice(bulkAmount)
         AccentButtonSmall(
-            text = "BUY $bulkAmount AUTOCLICKER${if (bulkAmount == 1) "" else "S"} — $autoclickerTotal",
+            text = "BUY $bulkAmount AUTOCLICKER${if (bulkAmount == 1) "" else "S"} — ${formatClicks(autoclickerTotal, numberFormat, numberDecimals)}",
             enabled = clicks >= autoclickerTotal,
             onClick = { onBuyAutoclickers(bulkAmount) }
         )
 
-        Text("Owned: $autoclickers", color = textColor)
+        Text("Owned: ${formatClicks(autoclickers, numberFormat, numberDecimals)}", color = textColor)
         Text(
-            "Current rate: ${autoclickers.multiply(BigInteger.valueOf((1 + autoSpeedLevel).toLong()))} clicks/sec",
+            "Current rate: ${formatClicks(autoclickers.multiply(BigInteger.valueOf((1 + autoSpeedLevel).toLong())), numberFormat, numberDecimals)} clicks/sec",
             color = textColor
         )
 
@@ -4183,7 +5023,7 @@ fun UpgradePanel(
 
             val speedTotal = speedTotalPrice(bulkAmount)
             AccentButtonSmall(
-                text = "BUY $bulkAmount SPEED${if (bulkAmount == 1) "" else "S"} — $speedTotal",
+                text = "BUY $bulkAmount SPEED${if (bulkAmount == 1) "" else "S"} — ${formatClicks(speedTotal, numberFormat, numberDecimals)}",
                 enabled = speedTotal > BigInteger.ZERO && clicks >= speedTotal,
                 onClick = { onBuyAutoSpeed(bulkAmount) }
             )
@@ -4198,7 +5038,7 @@ fun UpgradePanel(
 
         val multiplierTotal = multiplierTotalPrice(bulkAmount)
         AccentButtonSmall(
-            text = "BUY $bulkAmount MULTIPLIER${if (bulkAmount == 1) "" else "S"} — $multiplierTotal",
+            text = "BUY $bulkAmount MULTIPLIER${if (bulkAmount == 1) "" else "S"} — ${formatClicks(multiplierTotal, numberFormat, numberDecimals)}",
             enabled = clicks >= multiplierTotal,
             onClick = { onBuyMultiplier(bulkAmount) }
         )
@@ -4216,97 +5056,95 @@ fun ColorWheel(
     selectedColor: Color,
     onColorChange: (Color) -> Unit
 ) {
+    val hsv = remember(selectedColor) {
+        FloatArray(3).also { AndroidColor.colorToHSV(selectedColor.toArgb(), it) }
+    }
+
+    fun colorFromWheel(offset: Offset, width: Float, height: Float): Color? {
+        val centerX = width / 2f
+        val centerY = height / 2f
+        val dx = offset.x - centerX
+        val dy = offset.y - centerY
+        val distance = sqrt(dx * dx + dy * dy)
+        val radius = minOf(width, height) / 2f
+        if (distance > radius) return null
+        var hue = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
+        if (hue < 0f) hue += 360f
+        val saturation = (distance / radius).coerceIn(0f, 1f)
+        return Color.hsv(hue, saturation, hsv[2])
+    }
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-
-        Canvas(
-            modifier = Modifier
-                .size(240.dp)
-                .pointerInput(Unit) {
-                    detectTapGestures { offset ->
-                        val centerX = size.width / 2f
-                        val centerY = size.height / 2f
-                        val dx = offset.x - centerX
-                        val dy = offset.y - centerY
-                        val distance = sqrt(dx * dx + dy * dy)
-                        val radius = minOf(size.width, size.height) / 2f
-
-                        if (distance <= radius) {
-                            var hue = Math.toDegrees(
-                                atan2(dy.toDouble(), dx.toDouble())
-                            ).toFloat()
-
-                            if (hue < 0f) {
-                                hue += 360f
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Canvas(
+                modifier = Modifier
+                    .size(240.dp)
+                    .pointerInput(hsv[2]) {
+                        detectDragGestures(
+                            onDragStart = { position ->
+                                colorFromWheel(position, size.width.toFloat(), size.height.toFloat())?.let(onColorChange)
+                            },
+                            onDrag = { change, _ ->
+                                change.consume()
+                                colorFromWheel(change.position, size.width.toFloat(), size.height.toFloat())?.let(onColorChange)
                             }
-
-                            val saturation = (distance / radius).coerceIn(0f, 1f)
-                            val color = Color.hsv(hue = hue, saturation = saturation, value = 1f)
-                            onColorChange(color)
-                        }
+                        )
                     }
-                }
-        ) {
-
-            val center = Offset(size.width / 2f, size.height / 2f)
-            val radius = minOf(size.width, size.height) / 2f
-
-            drawCircle(
-                brush = Brush.sweepGradient(
-                    colors = listOf(
-                        Color.Red,
-                        Color.Yellow,
-                        Color.Green,
-                        Color.Cyan,
-                        Color.Blue,
-                        Color.Magenta,
-                        Color.Red
+            ) {
+                val center = Offset(size.width / 2f, size.height / 2f)
+                val radius = minOf(size.width, size.height) / 2f
+                drawCircle(
+                    brush = Brush.sweepGradient(
+                        colors = listOf(Color.Red, Color.Yellow, Color.Green, Color.Cyan, Color.Blue, Color.Magenta, Color.Red),
+                        center = center
                     ),
+                    radius = radius,
                     center = center
-                ),
-                radius = radius,
-                center = center
-            )
+                )
 
-            drawCircle(
-                color = Color.White,
-                radius = radius * 0.12f,
-                center = center
-            )
+                val angle = Math.toRadians(hsv[0].toDouble())
+                val selectedRadius = radius * hsv[1]
+                val point = Offset(
+                    center.x + cos(angle).toFloat() * selectedRadius,
+                    center.y + sin(angle).toFloat() * selectedRadius
+                )
+                drawCircle(Color.White, 11f, point, style = Stroke(width = 4f))
+                drawCircle(selectedColor, 6f, point)
+            }
 
-            val hsv = FloatArray(3)
-            AndroidColor.colorToHSV(selectedColor.toArgb(), hsv)
+            Spacer(Modifier.width(14.dp))
 
-            val angle = Math.toRadians(hsv[0].toDouble())
-            val selectedRadius = radius * hsv[1]
-
-            val x = center.x + cos(angle).toFloat() * selectedRadius
-            val y = center.y + sin(angle).toFloat() * selectedRadius
-
-            drawCircle(
-                color = Color.White,
-                radius = 10f,
-                center = androidx.compose.ui.geometry.Offset(x, y),
-                style = Stroke(width = 4f)
-            )
-
-            drawCircle(
-                color = selectedColor,
-                radius = 6f,
-                center = androidx.compose.ui.geometry.Offset(x, y)
-            )
+            Canvas(
+                modifier = Modifier
+                    .width(28.dp)
+                    .height(240.dp)
+                    .pointerInput(selectedColor) {
+                        fun update(y: Float) {
+                            val value = (y / size.height).coerceIn(0f, 1f)
+                            onColorChange(Color.hsv(hsv[0], hsv[1], value))
+                        }
+                        detectDragGestures(
+                            onDragStart = { pos -> update(pos.y) },
+                            onDrag = { change, _ ->
+                                change.consume()
+                                update(change.position.y)
+                            }
+                        )
+                    }
+            ) {
+                drawRoundRect(
+                    brush = Brush.verticalGradient(listOf(Color.Black, Color.White)),
+                    size = size,
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(14f)
+                )
+                val y = hsv[2] * size.height
+                drawCircle(Color.White, 8f, Offset(size.width / 2f, y), style = Stroke(width = 3f))
+            }
         }
 
         Spacer(Modifier.height(5.dp))
-
         Text(
-            text = "#${
-                selectedColor.toArgb()
-                    .and(0xFFFFFF)
-                    .toString(16)
-                    .uppercase()
-                    .padStart(6, '0')
-            }",
+            text = "#${selectedColor.toArgb().and(0xFFFFFF).toString(16).uppercase().padStart(6, '0')}",
             color = MaterialTheme.colorScheme.onBackground,
             fontWeight = FontWeight.Bold
         )
