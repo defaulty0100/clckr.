@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  a customizable clicker game for Android.
+  a customizable clicker game for android.
 </p>
 
 <p align="center">
@@ -25,13 +25,13 @@ complete daily challenges and more.
 
 ## features
 
-- 🖱️ customizable clicker
-- ⚡ autoclickers
-- 📈 click multipliers
-- 🎨 custom colors and skins
-- 🏆 ranked mode
-- 📅 daily challenges
-- ⚙️ extensive settings
+- customizable clicker
+-  autoclickers
+-  click multipliers
+-  custom colors and skins
+-  ranked mode
+-  daily challenges
+-  extensive settings
 
 ## screenshots
 
@@ -40,19 +40,6 @@ complete daily challenges and more.
   <img src="images/screenshot2.png" width="250">
   <img src="images/screenshot3.png" width="250">
 </p>
-
-## tech stack
-
-- Kotlin
-- Jetpack Compose
-- Android SDK
-- Gradle
-
-## installation
-
-1. download the latest APK from Releases.
-2. install it on your android device.
-3. launch **clckr.**
 
 ## development
 
