@@ -1,7 +1,7 @@
 # clckr.
 
 <p align="center">
-  <img src=src/banner.png width="800">
+  <img src=app/src/banner.png width="800">
 </p>
 
 <p align="center">
