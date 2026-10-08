@@ -39,6 +39,7 @@ complete daily challenges and more.
   <img src="app/src/screenshot1.png" width="250">
   <img src="app/src/screenshot2.png" width="250">
   <img src="app/src/screenshot3.png" width="250">
+(out of date, ill update them later)
 </p>
 
 ## development
